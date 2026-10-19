@@ -92,4 +92,10 @@ pub enum Error {
     VersionMismatch = 47,
     /// Feature not yet implemented.
     NotImplemented = 48,
+    /// Issue #1579: Template ID is empty, too long, or contains disallowed characters.
+    InvalidTemplateId = 49,
+    /// Issue #1566: A resource with this identifier already exists (e.g., template already exists).
+    ConflictError = 50,
+    /// Issue #1567: Attestation cannot be disputed (revoked, expired, etc.).
+    InvalidAttestation = 51,
 }

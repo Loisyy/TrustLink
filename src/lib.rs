@@ -649,6 +649,26 @@ impl TrustLinkContract {
         query::has_valid_claim_batch(&env, subjects, claim_type)
     }
 
+    /// Issue #1567: Check if a subject has a valid attestation of a specific claim type
+    /// that is NOT under an open dispute. Verifiers can use this to enforce
+    /// "valid and not under dispute" semantics.
+    #[must_use]
+    pub fn has_valid_undisputed_claim(env: Env, subject: Address, claim_type: String) -> bool {
+        query::has_valid_undisputed_claim(&env, subject, claim_type)
+    }
+
+    /// Issue #1567: Check if a subject has a valid attestation from a specific issuer
+    /// of a given claim type that is NOT under an open dispute.
+    #[must_use]
+    pub fn has_valid_undisputed_claim_from_issuer(
+        env: Env,
+        subject: Address,
+        claim_type: String,
+        issuer: Address,
+    ) -> bool {
+        query::has_valid_undisputed_claim_from_issuer(&env, subject, claim_type, issuer)
+    }
+
     #[must_use]
     pub fn get_attestation(env: Env, attestation_id: String) -> Result<Attestation, Error> {
         query::get_attestation(&env, attestation_id)
@@ -1074,10 +1094,20 @@ impl TrustLinkContract {
     /// window, and optional metadata. They can be instantiated later via
     /// [`create_attestation_from_template`].
     ///
+    /// Issue #1579: Enhanced validation to:
+    /// - Validate template_id (charset/length)
+    /// - Validate default_expiration_days (1..=MAX_TEMPLATE_DAYS)
+    /// - Reject silent overwrites (check for existing template)
+    /// - Use checked arithmetic for expiration calculation
+    /// - Prevent creation while paused
+    ///
     /// # Errors
     /// - [`Error::Unauthorized`] — `issuer` is not a registered issuer.
     /// - [`Error::InvalidClaimType`] — `claim_type` is empty or invalid.
     /// - [`Error::MetadataTooLong`] — `metadata_template` exceeds 256 bytes.
+    /// - [`Error::InvalidTemplateId`] — `template_id` is empty, too long, or contains invalid characters.
+    /// - [`Error::InvalidExpiration`] — `default_expiration_days` is 0 or exceeds MAX_TEMPLATE_DAYS.
+    /// - [`Error::ConflictError`] — `template_id` already exists (silent overwrite prevention).
     pub fn create_template(
         env: Env,
         issuer: Address,
@@ -1086,11 +1116,74 @@ impl TrustLinkContract {
     ) -> Result<(), Error> {
         issuer.require_auth();
         Validation::require_issuer(&env, &issuer)?;
+        Validation::require_not_paused(&env)?;
         Validation::validate_claim_type(&template.claim_type)?;
         Validation::validate_metadata(&env, &template.metadata_template)?;
+        
+        // Issue #1579: Validate template_id
+        Validation::validate_template_id(&template_id)?;
+        
+        // Issue #1579: Validate default_expiration_days
+        if let Some(days) = template.default_expiration_days {
+            if days < crate::constants::MIN_TEMPLATE_EXPIRATION_DAYS || days > crate::constants::MAX_TEMPLATE_EXPIRATION_DAYS {
+                return Err(Error::InvalidExpiration);
+            }
+        }
+        
+        // Issue #1579: Prevent silent overwrites
+        if let Some(_existing) = Storage::get_template(&env, &issuer, &template_id) {
+            return Err(Error::ConflictError); // Template already exists
+        }
 
         Storage::set_template(&env, &issuer, &template_id, &template);
         Storage::add_to_template_registry(&env, &issuer, &template_id);
+        
+        // Issue #1579: Emit template creation event
+        Events::template_created(&env, &issuer, &template_id);
+        
+        Ok(())
+    }
+
+    /// Update an existing attestation template for the calling issuer.
+    ///
+    /// Issue #1579: Explicit update function (separate from create) to prevent confusion.
+    /// Allows updating template configuration while maintaining an explicit audit trail.
+    ///
+    /// # Errors
+    /// - [`Error::Unauthorized`] — `issuer` is not a registered issuer.
+    /// - [`Error::NotFound`] — `template_id` does not exist for this issuer.
+    /// - [`Error::InvalidClaimType`] — `claim_type` is empty or invalid.
+    /// - [`Error::MetadataTooLong`] — `metadata_template` exceeds 256 bytes.
+    /// - [`Error::InvalidExpiration`] — `default_expiration_days` is 0 or exceeds MAX_TEMPLATE_DAYS.
+    pub fn update_template(
+        env: Env,
+        issuer: Address,
+        template_id: String,
+        template: AttestationTemplate,
+    ) -> Result<(), Error> {
+        issuer.require_auth();
+        Validation::require_issuer(&env, &issuer)?;
+        Validation::require_not_paused(&env)?;
+        Validation::validate_claim_type(&template.claim_type)?;
+        Validation::validate_metadata(&env, &template.metadata_template)?;
+        
+        // Issue #1579: Validate default_expiration_days
+        if let Some(days) = template.default_expiration_days {
+            if days < crate::constants::MIN_TEMPLATE_EXPIRATION_DAYS || days > crate::constants::MAX_TEMPLATE_EXPIRATION_DAYS {
+                return Err(Error::InvalidExpiration);
+            }
+        }
+        
+        // Verify template exists
+        if Storage::get_template(&env, &issuer, &template_id).is_none() {
+            return Err(Error::NotFound);
+        }
+
+        Storage::set_template(&env, &issuer, &template_id, &template);
+        
+        // Emit template update event
+        Events::template_updated(&env, &issuer, &template_id);
+        
         Ok(())
     }
 
@@ -1140,6 +1233,8 @@ impl TrustLinkContract {
     /// creates and stores the attestation using the same logic as
     /// [`create_attestation`].
     ///
+    /// Issue #1579: Uses checked arithmetic to prevent overflow in expiration calculation.
+    ///
     /// # Errors
     /// - [`Error::Unauthorized`] — `issuer` is not a registered issuer.
     /// - [`Error::NotFound`] — `template_id` does not exist for this issuer.
@@ -1153,6 +1248,7 @@ impl TrustLinkContract {
         expiration_override: Option<u64>,
         metadata_override: Option<String>,
     ) -> Result<String, Error> {
+        issuer.require_auth();
         Validation::require_issuer(&env, &issuer)?;
 
         let template = Storage::get_template(&env, &issuer, &template_id)
@@ -1169,10 +1265,16 @@ impl TrustLinkContract {
         }
 
         // Resolve final expiration: override > template default > None.
+        // Issue #1579: Use checked arithmetic to prevent overflow
         let expiration = if let Some(ts) = expiration_override {
             Some(ts)
         } else if let Some(days) = template.default_expiration_days {
-            Some(current_time + (days as u64) * crate::constants::SECS_PER_DAY)
+            // Use checked_mul and checked_add to prevent overflow
+            let secs = (days as u64).checked_mul(crate::constants::SECS_PER_DAY)
+                .ok_or(Error::InvalidExpiration)?;
+            let expiry = current_time.checked_add(secs)
+                .ok_or(Error::InvalidExpiration)?;
+            Some(expiry)
         } else {
             None
         };
