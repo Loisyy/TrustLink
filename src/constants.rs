@@ -17,3 +17,17 @@ pub const MIN_TTL_THRESHOLD: u32 = 7 * DAY_IN_LEDGERS;
 
 /// Maximum days for expiring attestations query window (issue #945).
 pub const MAX_EXPIRING_WINDOW_DAYS: u32 = 365;
+
+/// Issue #1579: Maximum allowed expiration days for a template.
+/// Prevents overflow and unreasonable expiration windows.
+pub const MAX_TEMPLATE_EXPIRATION_DAYS: u32 = 10_950; // ~30 years
+
+/// Issue #1579: Minimum allowed expiration days for a template.
+pub const MIN_TEMPLATE_EXPIRATION_DAYS: u32 = 1;
+
+/// Issue #1579: Maximum length for template IDs (like claim types).
+pub const MAX_TEMPLATE_ID_LEN: u32 = 256;
+
+/// Issue #1579: Minimum length for template IDs.
+pub const MIN_TEMPLATE_ID_LEN: u32 = 1;
+
